@@ -1983,15 +1983,61 @@ def initialize_server():
         raise
 
 if __name__ == "__main__":
-    logger.info("Starting Real AWS Organizations MCP Server with multi-institution support in STDIO mode...")
+    import sys
+    import os
+    import argparse
+    from contextlib import contextmanager
+    from io import StringIO
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Real AWS Organizations MCP Server')
+    parser.add_argument('--transport', choices=['stdio', 'sse'], default='stdio',
+                       help='Transport type: stdio (default) or sse (Server-Sent Events)')
+    parser.add_argument('--host', default='0.0.0.0',
+                       help='Host to bind SSE server (default: 0.0.0.0)')
+    parser.add_argument('--port', type=int, default=8080,
+                       help='Port to bind SSE server (default: 8080)')
+    
+    args = parser.parse_args()
+    
+    logger.info(f"Starting Real AWS Organizations MCP Server with multi-institution support in {args.transport.upper()} mode...")
+    
+    @contextmanager
+    def suppress_stdout_stderr():
+        """Context manager to temporarily suppress stdout and stderr during FastMCP startup."""
+        # Save original streams
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        
+        # Create string buffers to capture output
+        stdout_buffer = StringIO()
+        stderr_buffer = StringIO()
+        
+        try:
+            # Redirect streams to buffers
+            sys.stdout = stdout_buffer
+            sys.stderr = stderr_buffer
+            yield
+        finally:
+            # Restore original streams
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
     
     try:
-        # Initialize server
-        initialize_server()
+        # Initialize server with suppressed output
+        with suppress_stdout_stderr():
+            initialize_server()
         
-        # Run in STDIO mode for VSCode Roo plugin integration
-        logger.info("Starting MCP server with STDIO transport for VSCode Roo...")
-        mcp.run(transport="stdio")
+        if args.transport == "sse":
+            # Run in SSE mode for network connections
+            logger.info(f"Starting MCP server with SSE transport on {args.host}:{args.port}...")
+            mcp.run(transport="sse", host=args.host, port=args.port, show_banner=False)
+        else:
+            # Run in STDIO mode for VSCode Roo plugin integration
+            logger.info("Starting MCP server with STDIO transport for VSCode Roo...")
+            
+            # Suppress banner for STDIO mode as well to prevent MCP protocol interference
+            mcp.run(transport="stdio", show_banner=False)
         
     except Exception as e:
         logger.error(f"Failed to start MCP server: {e}")
