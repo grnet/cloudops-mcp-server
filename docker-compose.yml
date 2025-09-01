@@ -1,0 +1,14 @@
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    volumes:
+      - .:/app
+    command: ["python", "main.py"]
+    environment:
+      - PYTHONUNBUFFERED=1

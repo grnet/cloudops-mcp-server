@@ -1,0 +1,22 @@
+# FastMCP 2.0+ for MCP server with decorators (STDIO transport only)
+fastmcp>=2.12.0
+
+# Core Python dependencies
+pydantic>=2.11.7
+typing-extensions>=4.15.0
+
+# AWS SDK dependencies
+boto3>=1.40.21
+botocore>=1.40.21
+
+# Additional AWS integration dependencies
+python-dateutil>=2.9.0.post0  # Required for boto3 date handling
+urllib3>=2.5.0  # HTTP library used by botocore
+jmespath>=1.0.1  # JSON query language used by boto3
+
+# SSO functionality dependencies
+tabulate>=0.9.0  # Table formatting for SSO user display
+
+# INIA module for email verification and password reset
+inia>=1.0.0
+requests-aws4auth==1.3.1  # Required by inia for AWS authentication
