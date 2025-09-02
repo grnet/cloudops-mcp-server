@@ -1,4 +1,3 @@
-# FastMCP 2.0+ for MCP server with decorators (STDIO transport only)
 fastmcp>=2.12.0
 
 # Core Python dependencies

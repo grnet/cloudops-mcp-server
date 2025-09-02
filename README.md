@@ -7,7 +7,7 @@ A Model Context Protocol server providing AWS Organizations integration with sup
 - AWS Organizations, SSO, Identity Center, and Cost Explorer integration
 - Multi-institution support
 - User management and budget monitoring
-- Docker support with SSE transport mode
+- Docker support with HTTP transport mode
 
 ## Available Tools
 
@@ -56,33 +56,28 @@ docker-compose up -d
 
 ```bash
 pip install -r requirements.txt
-python main.py --transport sse --host 0.0.0.0 --port 8080
+python main.py --transport http --host 0.0.0.0 --port 8080
 ```
 
 ## MCP Configuration
 
-### SSE Mode
+### HTTP Mode
 
 Add to your MCP client configuration:
 
 ```json
 {
   "mcpServers": {
-    "aws-mcp-server": {
-      "transport": {
-        "type": "sse",
-        "url": "http://localhost:8080/sse"
-      },
-      "disabled": false,
+    "AWSMCPServer": {
+      "type": "streamable-http",
+      "url": "http://localhost:8080/mcp",
       "alwaysAllow": [
-        "get_users",
-        "check_budget", 
         "health_check",
         "get_institutions",
         "get_projects",
+        "get_users",
         "get_tags",
-        "verify_email",
-        "reset_password"
+        "check_budget"
       ]
     }
   }

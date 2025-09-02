@@ -23,5 +23,4 @@ USER app
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Default command runs the server in STDIO mode for VSCode Roo integration
 CMD ["python", "main.py"]
