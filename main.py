@@ -800,40 +800,53 @@ def get_projects(
         return handle_aws_error(e, "get_projects", institution)
 
 
-# SSO Helper Functions
 def _fetch_sso_users(sso_client: Any, identity_store_id: str) -> Dict[str, Any]:
-    """Fetch users from AWS SSO Identity Store."""
+    """Fetch users from AWS SSO Identity Store using search_users approach."""
     users = {}
 
     try:
-        # Use identitystore client to search users
-        identitystore_client = sso_client  # Assuming this is the identitystore client
-        user_list = identitystore_client.list_users(IdentityStoreId=identity_store_id)
+        user_list = sso_client.search_users(identity_store_id, filter=[])
 
-        for user in user_list.get("Users", []):
+        for user in user_list:
             user_id = user["UserId"]
 
-            # Extract display name
-            display_name = user.get("DisplayName", user.get("UserName", "Unknown"))
+            display_name = None
+            if "displayName" in user.get("UserAttributes", {}):
+                display_name = user["UserAttributes"]["displayName"].get("StringValue")
 
-            # Extract emails and status
+            given_name = family_name = None
+            if "name" in user.get("UserAttributes", {}):
+                name_complex = user["UserAttributes"]["name"].get("ComplexValue", {})
+                given_name = name_complex.get("givenName", {}).get("StringValue")
+                family_name = name_complex.get("familyName", {}).get("StringValue")
+
             emails = []
-            for email in user.get("Emails", []):
-                emails.append(
-                    {
-                        "Value": email.get("Value", ""),
-                        "Primary": email.get("Primary", False),
-                        "Status": (
-                            "Verified" if email.get("Primary") else "Not_Verified"
-                        ),
-                    }
+            if "emails" in user.get("UserAttributes", {}):
+                email_list = user["UserAttributes"]["emails"].get(
+                    "ComplexListValue", []
                 )
+                for email_entry in email_list:
+                    primary = email_entry.get("primary", {}).get("BooleanValue", False)
+                    value = email_entry.get("value", {}).get("StringValue")
+                    status = email_entry.get("verificationStatus", {}).get(
+                        "StringValue", "Not_Verified"
+                    )
+
+                    if value:
+                        emails.append(
+                            {"Value": value, "Primary": primary, "Status": status}
+                        )
+
+            if not display_name and given_name and family_name:
+                display_name = f"{given_name} {family_name}"
+            elif not display_name:
+                display_name = user.get("UserName", "Unknown")
 
             users[user_id] = {
                 "DisplayName": display_name,
                 "UserName": user.get("UserName", ""),
                 "Emails": emails,
-                "Active": True,  # SSO users are typically active
+                "Active": user.get("Active", False),
                 "Sent": False,
                 "Reset": False,
             }
@@ -1204,8 +1217,16 @@ def get_users(
                 "error": f"Could not access SSO instance: {e.response['Error']['Message']}",
             }
 
+        # Create SSO client for user fetching (using inia module)
+        sso_client = _create_sso_client(institution)
+        if not sso_client:
+            return {
+                "success": False,
+                "error": f"Could not create SSO client for institution '{institution}'. inia module may not be available.",
+            }
+
         # Fetch SSO data
-        users = _fetch_sso_users(identitystore_client, sso_instance_id)
+        users = _fetch_sso_users(sso_client, sso_instance_id)
         groups = (
             _fetch_sso_groups(identitystore_client, sso_instance_id)
             if include_groups
