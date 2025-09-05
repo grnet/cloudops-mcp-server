@@ -1462,22 +1462,32 @@ def _get_date_range(
         return first_day_current, today
 
 
-def _validate_date_range(start_date: date, end_date: date) -> bool:
-    """Validate date range for cost analysis."""
-    if start_date > end_date:
-        return False
-
-    # AWS Cost Explorer has limitations
+def _validate_date_range(start_date: date, end_date: date) -> tuple[bool, date, date]:
+    """
+    Validate and adjust date range for cost analysis.
+    Returns (is_valid, adjusted_start_date, adjusted_end_date)
+    """
     today = datetime.now(timezone.utc).date()
+    original_start_date = start_date
+    original_end_date = end_date
+
+    # Add debug logging
+    logger.info(f"Validating date range: {start_date} to {end_date}, today: {today}")
+
+    if start_date > end_date:
+        logger.error(f"Start date {start_date} is after end date {end_date}")
+        return False, original_start_date, original_end_date
+
+    # AWS Cost Explorer has limitations - end date can be today or in the past
+    # Allow end_date to be today (>=) instead of rejecting it (>)
     if end_date > today:
-        return False
+        logger.warning(
+            f"End date {end_date} is in the future, adjusting to today: {today}"
+        )
+        end_date = today
 
-    # Check if date range is not too far in the past (AWS keeps ~13 months)
-    max_past_date = today - timedelta(days=365)
-    if start_date < max_past_date:
-        return False
-
-    return True
+    logger.info(f"Date range validation passed: {start_date} to {end_date}")
+    return True, start_date, end_date
 
 
 def _fetch_cost_explorer_data(
@@ -1488,7 +1498,7 @@ def _fetch_cost_explorer_data(
     granularity: str = "DAILY",
     exclude_services: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Fetch cost data from AWS Cost Explorer."""
+    """Fetch cost data from AWS Cost Explorer with automatic date adjustment for ValidationException."""
     if exclude_services is None:
         exclude_services = ["Tax"]
 
@@ -1586,54 +1596,155 @@ def _process_cost_data(raw_data: Dict[str, Any]) -> Dict[str, Any]:
     return processed_costs
 
 
+def _get_ou_for_account(orgs_client: Any, account_id: str, root_id: str) -> Optional[str]:
+    """Find the OU that contains a specific account."""
+    try:
+        # Get parents for the account
+        parents_response = orgs_client.list_parents(ChildId=account_id)
+        if not parents_response.get("Parents"):
+            return None
+            
+        parent = parents_response["Parents"][0]
+        if parent["Type"] == "ORGANIZATIONAL_UNIT":
+            return parent["Id"]
+        elif parent["Type"] == "ROOT":
+            # Account is directly under root, no OU
+            return None
+            
+    except ClientError as e:
+        logger.warning(f"Could not get parent for account {account_id}: {e}")
+        return None
+    
+    return None
+
+
+def _get_budget_from_ou_hierarchy(orgs_client: Any, ou_id: str, root_id: str) -> Optional[float]:
+    """Traverse OU hierarchy upward to find budget tags."""
+    current_ou_id = ou_id
+    
+    while current_ou_id and current_ou_id != root_id:
+        try:
+            # Get tags for current OU
+            tags_response = orgs_client.list_tags_for_resource(ResourceId=current_ou_id)
+            tags = {
+                tag["Key"]: tag["Value"]
+                for tag in tags_response.get("Tags", [])
+            }
+            
+            # Check if this OU has a budget tag
+            budget_str = tags.get("Budget")
+            if budget_str and budget_str != "Not specified":
+                try:
+                    # Clean budget string and convert to float
+                    budget_value = float(budget_str.replace("$", "").replace(",", ""))
+                    logger.info(f"Found budget {budget_value} in OU {current_ou_id}")
+                    return budget_value
+                except (ValueError, AttributeError) as e:
+                    logger.warning(f"Could not parse budget value '{budget_str}' from OU {current_ou_id}: {e}")
+            
+            # Move to parent OU
+            parents_response = orgs_client.list_parents(ChildId=current_ou_id)
+            if not parents_response.get("Parents"):
+                break
+                
+            parent = parents_response["Parents"][0]
+            if parent["Type"] == "ORGANIZATIONAL_UNIT":
+                current_ou_id = parent["Id"]
+            else:
+                # Reached root
+                break
+                
+        except ClientError as e:
+            logger.warning(f"Could not get tags or parents for OU {current_ou_id}: {e}")
+            break
+    
+    return None
+
+
 def _get_project_budgets(institution: str, project_ids: List[str]) -> Dict[str, float]:
-    """Extract budgets from project tags/metadata using existing get_projects function."""
+    """Extract budgets from OU tags and account tags, prioritizing OU hierarchy."""
     budgets = {}
 
     try:
         # Get projects data for the institution
-        # We need to find the master account ID for this institution
         orgs_client = get_aws_client("organizations", institution)
         if not orgs_client:
+            logger.error(f"Could not create organizations client for institution {institution}")
             return budgets
 
-        # Get organization info to find master account
-        org_response = orgs_client.describe_organization()
-        master_account_id = org_response["Organization"]["MasterAccountId"]
+        # Get organization info to find root
+        try:
+            org_response = orgs_client.describe_organization()
+            master_account_id = org_response["Organization"]["MasterAccountId"]
+            
+            # Get organization roots
+            roots_response = orgs_client.list_roots()
+            if not roots_response.get("Roots"):
+                logger.error("No organization roots found")
+                return budgets
+            
+            root_id = roots_response["Roots"][0]["Id"]
+            logger.info(f"Using organization root: {root_id}")
+            
+        except ClientError as e:
+            logger.error(f"Could not access organization info: {e}")
+            return budgets
 
         # Get all accounts to find budgets
-        accounts_response = orgs_client.list_accounts()
-        accounts = accounts_response["Accounts"]
+        try:
+            accounts_response = orgs_client.list_accounts()
+            accounts = accounts_response["Accounts"]
+        except ClientError as e:
+            logger.error(f"Could not list accounts: {e}")
+            return budgets
 
         for account in accounts:
             account_id = account["Id"]
-            if account_id in project_ids:
-                try:
-                    # Get account tags
-                    tags_response = orgs_client.list_tags_for_resource(
-                        ResourceId=account_id
-                    )
+            if account_id not in project_ids:
+                continue
+                
+            budget_found = False
+            
+            try:
+                # First, try to find budget in OU hierarchy
+                ou_id = _get_ou_for_account(orgs_client, account_id, root_id)
+                if ou_id:
+                    logger.info(f"Account {account_id} is in OU {ou_id}, checking OU hierarchy for budget")
+                    budget_value = _get_budget_from_ou_hierarchy(orgs_client, ou_id, root_id)
+                    if budget_value is not None:
+                        budgets[account_id] = budget_value
+                        budget_found = True
+                        logger.info(f"Found budget {budget_value} for account {account_id} from OU hierarchy")
+                
+                # If no budget found in OU hierarchy, check account tags as fallback
+                if not budget_found:
+                    logger.info(f"No budget found in OU hierarchy for account {account_id}, checking account tags")
+                    tags_response = orgs_client.list_tags_for_resource(ResourceId=account_id)
                     tags = {
                         tag["Key"]: tag["Value"]
                         for tag in tags_response.get("Tags", [])
                     }
 
-                    # Extract budget from tags
+                    # Extract budget from account tags
                     budget_str = tags.get("Budget", "0")
                     if budget_str and budget_str != "Not specified":
                         try:
                             # Clean budget string and convert to float
-                            budget_value = float(
-                                budget_str.replace("$", "").replace(",", "")
-                            )
+                            budget_value = float(budget_str.replace("$", "").replace(",", ""))
                             budgets[account_id] = budget_value
-                        except (ValueError, AttributeError):
-                            budgets[account_id] = 0.0
-                    else:
-                        budgets[account_id] = 0.0
-
-                except ClientError:
+                            budget_found = True
+                            logger.info(f"Found budget {budget_value} for account {account_id} from account tags")
+                        except (ValueError, AttributeError) as e:
+                            logger.warning(f"Could not parse budget value '{budget_str}' from account {account_id}: {e}")
+                
+                # If still no budget found, set to 0
+                if not budget_found:
                     budgets[account_id] = 0.0
+                    logger.info(f"No budget found for account {account_id}, setting to 0")
+
+            except ClientError as e:
+                logger.warning(f"Could not get budget for account {account_id}: {e}")
+                budgets[account_id] = 0.0
 
     except Exception as e:
         logger.error(f"Error getting project budgets: {e}")
@@ -1801,8 +1912,10 @@ def check_budget(
         except Exception as e:
             return {"success": False, "error": f"Invalid date range: {str(e)}"}
 
-        # Validate date range
-        if not _validate_date_range(analysis_start, analysis_end):
+        is_valid, analysis_start, analysis_end = _validate_date_range(
+            analysis_start, analysis_end
+        )
+        if not is_valid:
             return {
                 "success": False,
                 "error": "Invalid date range. End date must be after start date and not in the future.",
