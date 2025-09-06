@@ -1596,96 +1596,146 @@ def _process_cost_data(raw_data: Dict[str, Any]) -> Dict[str, Any]:
     return processed_costs
 
 
-def _get_ou_for_account(orgs_client: Any, account_id: str, root_id: str) -> Optional[str]:
-    """Find the OU that contains a specific account."""
+def _get_ou_for_account(
+    orgs_client: Any, account_id: str, root_id: str
+) -> Optional[str]:
+    """Find the OU that contains a specific account with enhanced error handling and logging."""
     try:
         # Get parents for the account
         parents_response = orgs_client.list_parents(ChildId=account_id)
         if not parents_response.get("Parents"):
+            logger.warning(f"No parents found for account {account_id}")
             return None
-            
+
         parent = parents_response["Parents"][0]
+
         if parent["Type"] == "ORGANIZATIONAL_UNIT":
             return parent["Id"]
         elif parent["Type"] == "ROOT":
             # Account is directly under root, no OU
             return None
-            
+        else:
+            logger.warning(
+                f"Unexpected parent type '{parent['Type']}' for account {account_id}"
+            )
+            return None
+
     except ClientError as e:
-        logger.warning(f"Could not get parent for account {account_id}: {e}")
+        error_code = e.response.get("Error", {}).get("Code", "Unknown")
+        error_message = e.response.get("Error", {}).get("Message", str(e))
+        logger.error(
+            f"AWS API error getting parent for account {account_id}: {error_code} - {error_message}"
+        )
         return None
-    
-    return None
+    except Exception as e:
+        logger.error(f"Unexpected error getting parent for account {account_id}: {e}")
+        return None
 
 
-def _get_budget_from_ou_hierarchy(orgs_client: Any, ou_id: str, root_id: str) -> Optional[float]:
-    """Traverse OU hierarchy upward to find budget tags."""
+def _get_budget_from_ou_hierarchy(
+    orgs_client: Any, ou_id: str, root_id: str
+) -> Optional[float]:
+    """Traverse OU hierarchy upward to find budget tags, including root OU check."""
     current_ou_id = ou_id
-    
+
     while current_ou_id and current_ou_id != root_id:
         try:
             # Get tags for current OU
             tags_response = orgs_client.list_tags_for_resource(ResourceId=current_ou_id)
-            tags = {
-                tag["Key"]: tag["Value"]
-                for tag in tags_response.get("Tags", [])
-            }
-            
+            tags = {tag["Key"]: tag["Value"] for tag in tags_response.get("Tags", [])}
+
             # Check if this OU has a budget tag
             budget_str = tags.get("Budget")
             if budget_str and budget_str != "Not specified":
                 try:
                     # Clean budget string and convert to float
                     budget_value = float(budget_str.replace("$", "").replace(",", ""))
-                    logger.info(f"Found budget {budget_value} in OU {current_ou_id}")
                     return budget_value
                 except (ValueError, AttributeError) as e:
-                    logger.warning(f"Could not parse budget value '{budget_str}' from OU {current_ou_id}: {e}")
-            
+                    logger.error(
+                        f"Could not parse budget value '{budget_str}' from OU {current_ou_id}: {e}"
+                    )
+
             # Move to parent OU
             parents_response = orgs_client.list_parents(ChildId=current_ou_id)
             if not parents_response.get("Parents"):
                 break
-                
+
             parent = parents_response["Parents"][0]
+
             if parent["Type"] == "ORGANIZATIONAL_UNIT":
                 current_ou_id = parent["Id"]
             else:
-                # Reached root
+                # Reached root - check root OU for budget tags before stopping
+                try:
+                    root_tags_response = orgs_client.list_tags_for_resource(
+                        ResourceId=parent["Id"]
+                    )
+                    root_tags = {
+                        tag["Key"]: tag["Value"]
+                        for tag in root_tags_response.get("Tags", [])
+                    }
+
+                    root_budget_str = root_tags.get("Budget")
+                    if root_budget_str and root_budget_str != "Not specified":
+                        try:
+                            root_budget_value = float(
+                                root_budget_str.replace("$", "").replace(",", "")
+                            )
+                            return root_budget_value
+                        except (ValueError, AttributeError) as e:
+                            logger.error(
+                                f"Could not parse budget value '{root_budget_str}' from root OU {parent['Id']}: {e}"
+                            )
+                except ClientError as e:
+                    error_code = e.response.get("Error", {}).get("Code", "Unknown")
+                    error_message = e.response.get("Error", {}).get("Message", str(e))
+                    logger.error(
+                        f"Could not get tags for root OU {parent['Id']}: {error_code} - {error_message}"
+                    )
+
                 break
-                
+
         except ClientError as e:
-            logger.warning(f"Could not get tags or parents for OU {current_ou_id}: {e}")
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            error_message = e.response.get("Error", {}).get("Message", str(e))
+            logger.error(
+                f"Could not get tags or parents for OU {current_ou_id}: {error_code} - {error_message}"
+            )
             break
-    
+        except Exception as e:
+            logger.error(f"Unexpected error processing OU {current_ou_id}: {e}")
+            break
+
     return None
 
 
 def _get_project_budgets(institution: str, project_ids: List[str]) -> Dict[str, float]:
-    """Extract budgets from OU tags and account tags, prioritizing OU hierarchy."""
+    """Extract budgets from OU tags only - budgets are ONLY set on OUs, never on accounts."""
     budgets = {}
 
     try:
         # Get projects data for the institution
         orgs_client = get_aws_client("organizations", institution)
         if not orgs_client:
-            logger.error(f"Could not create organizations client for institution {institution}")
+            logger.error(
+                f"Could not create organizations client for institution {institution}"
+            )
             return budgets
 
         # Get organization info to find root
         try:
             org_response = orgs_client.describe_organization()
             master_account_id = org_response["Organization"]["MasterAccountId"]
-            
+
             # Get organization roots
             roots_response = orgs_client.list_roots()
             if not roots_response.get("Roots"):
                 logger.error("No organization roots found")
                 return budgets
-            
+
             root_id = roots_response["Roots"][0]["Id"]
-            logger.info(f"Using organization root: {root_id}")
-            
+
         except ClientError as e:
             logger.error(f"Could not access organization info: {e}")
             return budgets
@@ -1702,48 +1752,66 @@ def _get_project_budgets(institution: str, project_ids: List[str]) -> Dict[str, 
             account_id = account["Id"]
             if account_id not in project_ids:
                 continue
-                
+
             budget_found = False
-            
+
             try:
-                # First, try to find budget in OU hierarchy
+                # Try to find budget in OU hierarchy (budgets are ONLY on OUs)
                 ou_id = _get_ou_for_account(orgs_client, account_id, root_id)
                 if ou_id:
-                    logger.info(f"Account {account_id} is in OU {ou_id}, checking OU hierarchy for budget")
-                    budget_value = _get_budget_from_ou_hierarchy(orgs_client, ou_id, root_id)
+                    budget_value = _get_budget_from_ou_hierarchy(
+                        orgs_client, ou_id, root_id
+                    )
                     if budget_value is not None:
                         budgets[account_id] = budget_value
                         budget_found = True
-                        logger.info(f"Found budget {budget_value} for account {account_id} from OU hierarchy")
-                
-                # If no budget found in OU hierarchy, check account tags as fallback
-                if not budget_found:
-                    logger.info(f"No budget found in OU hierarchy for account {account_id}, checking account tags")
-                    tags_response = orgs_client.list_tags_for_resource(ResourceId=account_id)
-                    tags = {
-                        tag["Key"]: tag["Value"]
-                        for tag in tags_response.get("Tags", [])
-                    }
+                else:
+                    # Account is directly under root - check if root OU has budget tags
+                    try:
+                        root_tags_response = orgs_client.list_tags_for_resource(
+                            ResourceId=root_id
+                        )
+                        root_tags = {
+                            tag["Key"]: tag["Value"]
+                            for tag in root_tags_response.get("Tags", [])
+                        }
 
-                    # Extract budget from account tags
-                    budget_str = tags.get("Budget", "0")
-                    if budget_str and budget_str != "Not specified":
-                        try:
-                            # Clean budget string and convert to float
-                            budget_value = float(budget_str.replace("$", "").replace(",", ""))
-                            budgets[account_id] = budget_value
-                            budget_found = True
-                            logger.info(f"Found budget {budget_value} for account {account_id} from account tags")
-                        except (ValueError, AttributeError) as e:
-                            logger.warning(f"Could not parse budget value '{budget_str}' from account {account_id}: {e}")
-                
-                # If still no budget found, set to 0
+                        root_budget_str = root_tags.get("Budget")
+                        if root_budget_str and root_budget_str != "Not specified":
+                            try:
+                                root_budget_value = float(
+                                    root_budget_str.replace("$", "").replace(",", "")
+                                )
+                                budgets[account_id] = root_budget_value
+                                budget_found = True
+                            except (ValueError, AttributeError) as e:
+                                logger.error(
+                                    f"Could not parse budget value '{root_budget_str}' from root OU {root_id}: {e}"
+                                )
+                    except ClientError as e:
+                        error_code = e.response.get("Error", {}).get("Code", "Unknown")
+                        error_message = e.response.get("Error", {}).get(
+                            "Message", str(e)
+                        )
+                        logger.error(
+                            f"Could not get tags for root OU {root_id}: {error_code} - {error_message}"
+                        )
+
+                # If no budget found, set to 0 (budgets are ONLY on OUs, never check account tags)
                 if not budget_found:
                     budgets[account_id] = 0.0
-                    logger.info(f"No budget found for account {account_id}, setting to 0")
 
             except ClientError as e:
-                logger.warning(f"Could not get budget for account {account_id}: {e}")
+                error_code = e.response.get("Error", {}).get("Code", "Unknown")
+                error_message = e.response.get("Error", {}).get("Message", str(e))
+                logger.error(
+                    f"Could not get budget for account {account_id}: {error_code} - {error_message}"
+                )
+                budgets[account_id] = 0.0
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error getting budget for account {account_id}: {e}"
+                )
                 budgets[account_id] = 0.0
 
     except Exception as e:
