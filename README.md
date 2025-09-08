@@ -2,6 +2,12 @@
 
 A Model Context Protocol server providing AWS Organizations integration with support for institutions, projects, users, and budget monitoring.
 
+## Demo
+
+<video src="https://github.com/user-attachments/assets/e1101a25-82b5-4795-a9ee-bfe840289d3c" controls style="width: 48%; max-width: 600px;" alt="AWS Organizations MCP Server Demo">
+  Your browser does not support the video tag.
+</video>
+
 ## Features
 
 - AWS Organizations, SSO, Identity Center, and Cost Explorer integration
